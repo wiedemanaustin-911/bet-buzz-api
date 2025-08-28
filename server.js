@@ -127,5 +127,67 @@ app.get('/api/chatter', async (req,res)=>{
     res.json({score:avg, snippets});
   }catch(e){ console.error(e); res.status(500).json({error:'reddit chatter failed'}); }
 });
+// === NEW: return ALL events with odds in one call ===
+// GET /api/odds-all  -> { events: [ { id, commence_time, home, away, odds:{spread, moneyline, total} } ] }
+app.get('/api/odds-all', async (req, res) => {
+  try {
+    const url = `https://api.the-odds-api.com/v4/sports/americanfootball_ncaaf/odds` +
+      `?regions=us&markets=h2h,spreads,totals&oddsFormat=american&bookmakers=draftkings,fanduel,betmgm,pointsbetus` +
+      `&dateFormat=iso&apiKey=${process.env.ODDS_API_KEY}`;
+
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(`OddsAPI ${r.status}`);
+    const events = await r.json();
+
+    const out = events.map(ev => {
+      const id = ev.id || `${(ev.away_team||'').toLowerCase()}-at-${(ev.home_team||'').toLowerCase()}-${ev.commence_time}`;
+      const byKey = Object.fromEntries((ev.bookmakers||[]).map(bm => [bm.key || bm.title, bm]));
+
+      // helper to pull and flatten a market across books
+      const flatten = (marketKey) => {
+        const lines = [];
+        for (const bm of (ev.bookmakers || [])) {
+          const book = (bm.key || bm.title || 'book').toUpperCase();
+          const m = (bm.markets || []).find(x => x.key === marketKey);
+          if (!m) continue;
+          if (marketKey === 'spreads') {
+            const h = m.outcomes?.find(o => o.name === ev.home_team);
+            const a = m.outcomes?.find(o => o.name === ev.away_team);
+            if (h && a) lines.push({ book, home: h.point, away: a.point, price_home: h.price, price_away: a.price });
+          } else if (marketKey === 'h2h') {
+            const h = m.outcomes?.find(o => o.name === ev.home_team);
+            const a = m.outcomes?.find(o => o.name === ev.away_team);
+            if (h && a) lines.push({ book, home: h.price, away: a.price });
+          } else if (marketKey === 'totals') {
+            const over = m.outcomes?.find(o => (o.name || '').toLowerCase() === 'over');
+            const under = m.outcomes?.find(o => (o.name || '').toLowerCase() === 'under');
+            if (over && under) lines.push({ book, over: over.point, under: under.point, price_over: over.price, price_under: under.price });
+          }
+        }
+        return lines;
+      };
+
+      const totalLines = flatten('totals');
+      const target = totalLines.length ? totalLines.reduce((a,b)=>a + (+b.over || +b.under || 0),0)/totalLines.length : null;
+
+      return {
+        id,
+        commence_time: ev.commence_time,
+        home: ev.home_team,
+        away: ev.away_team,
+        odds: {
+          spread:   { side: 'home',   lines: flatten('spreads') },
+          moneyline:{ side: 'home',   lines: flatten('h2h') },
+          total:    { target,         lines: totalLines }
+        }
+      };
+    });
+
+    res.json({ events: out });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'odds-all failed' });
+  }
+});
 
 app.listen(PORT, ()=>console.log(`API running on http://localhost:${PORT}`));
